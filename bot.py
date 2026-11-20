@@ -527,6 +527,11 @@ def setup_logging(log_dir: str, level: str) -> None:
     fmt = logging.Formatter("%(asctime)s %(levelname)-7s %(name)s: %(message)s")
     root = logging.getLogger()
     root.setLevel(level.upper())
+    # Console Windows (cp1252) không in được tiếng Việt -> thay ký tự lạ thay vì văng traceback
+    try:
+        sys.stdout.reconfigure(errors="replace")  # type: ignore[union-attr]
+    except (AttributeError, ValueError):
+        pass
     console = logging.StreamHandler(sys.stdout)
     console.setFormatter(fmt)
     file_handler = RotatingFileHandler(Path(log_dir) / "bot.log", maxBytes=5_000_000, backupCount=10, encoding="utf-8")
