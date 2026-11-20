@@ -578,6 +578,7 @@ async def main_async(args: argparse.Namespace) -> int:
         url=s.ai_endpoint_url, api_key=s.ai_api_key.get_secret_value(), model=s.ai_model, style=s.ai_api_style,
         timeout=s.ai_timeout_sec, max_retries=s.ai_max_retries, temperature=s.ai_temperature,
         json_mode=s.ai_json_mode,
+        fallback_models=[m.strip() for m in s.ai_fallback_models.split(",") if m.strip()],
         system_prompt=build_system_prompt(s.ai_reasoning_language, s.min_rr, s.min_sl_atr_mult, s.max_sl_atr_mult),
     )
     notifier: TelegramNotifier | NullNotifier = (

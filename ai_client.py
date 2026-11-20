@@ -25,6 +25,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 log = logging.getLogger(__name__)
 
 RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
+# Hết hạn mức / quá tải: thử lại ngay cùng model hầu như vô ích -> chuyển sang model dự phòng
+SWITCH_MODEL_STATUS = {429, 503}
 
 
 class Action(str, Enum):
@@ -173,9 +175,12 @@ class AIClient:
         backoff_base: float = 1.0,
         backoff_max: float = 15.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        fallback_models: list[str] | None = None,
     ) -> None:
         self.url = url
         self.model = model
+        self.models = [model] + [m for m in (fallback_models or []) if m and m != model]
+        self.last_model = model
         self.style = style
         self.max_retries = max_retries
         self.temperature = temperature
@@ -196,11 +201,12 @@ class AIClient:
         await self._client.aclose()
 
     # ------------------------------------------------------------------ payload
-    def _build_payload(self, snapshot: dict[str, Any]) -> dict[str, Any]:
+    def _build_payload(self, snapshot: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+        model = model or self.model
         if self.style == "custom":
-            return {"model": self.model, "system": self.system_prompt, "snapshot": snapshot}
+            return {"model": model, "system": self.system_prompt, "snapshot": snapshot}
         payload: dict[str, Any] = {
-            "model": self.model,
+            "model": model,
             "temperature": self.temperature,
             "messages": [
                 {"role": "system", "content": self.system_prompt},
@@ -227,44 +233,59 @@ class AIClient:
 
     # ------------------------------------------------------------------ main
     async def decide(self, snapshot: dict[str, Any]) -> AIResult:
-        """Gửi snapshot, trả về AIResult. KHÔNG bao giờ raise – lỗi => HOLD fallback."""
-        payload = self._build_payload(snapshot)
+        """Gửi snapshot, trả về AIResult. KHÔNG bao giờ raise – lỗi => HOLD fallback.
+
+        Mỗi model được thử tối đa ``max_retries`` lần; gặp HTTP 429/503 (hết quota/quá tải)
+        thì chuyển ngay sang model dự phòng kế tiếp (``AI_FALLBACK_MODELS``).
+        """
         started = time.perf_counter()
         last_error = "unknown error"
         raw_text: str | None = None
         attempt = 0
+        payload: dict[str, Any] = {}
 
-        for attempt in range(1, self.max_retries + 1):
-            retry_after: float | None = None
-            try:
-                resp = await self._client.post(self.url, json=payload)
-                if resp.status_code in RETRYABLE_STATUS:
-                    ra = resp.headers.get("retry-after")
-                    retry_after = float(ra) if ra and ra.replace(".", "", 1).isdigit() else None
-                    raise httpx.HTTPStatusError(f"HTTP {resp.status_code}", request=resp.request, response=resp)
-                if resp.status_code >= 400:
-                    # 4xx khác (401, 400...) – không retry, lỗi cấu hình
-                    last_error = f"HTTP {resp.status_code}: {resp.text[:300]}"
+        for mi, model in enumerate(self.models):
+            payload = self._build_payload(snapshot, model)
+            for try_no in range(1, self.max_retries + 1):
+                attempt += 1
+                retry_after: float | None = None
+                switch = False
+                tag = f"{model} {try_no}/{self.max_retries}"
+                try:
+                    resp = await self._client.post(self.url, json=payload)
+                    if resp.status_code in RETRYABLE_STATUS:
+                        ra = resp.headers.get("retry-after")
+                        retry_after = float(ra) if ra and ra.replace(".", "", 1).isdigit() else None
+                        switch = resp.status_code in SWITCH_MODEL_STATUS and mi + 1 < len(self.models)
+                        raise httpx.HTTPStatusError(f"HTTP {resp.status_code}", request=resp.request, response=resp)
+                    if resp.status_code >= 400:
+                        # 4xx khác (401, 400, 404...) – lỗi cấu hình: thử model khác nếu có, không retry
+                        last_error = f"[{model}] HTTP {resp.status_code}: {resp.text[:300]}"
+                        log.warning("AI call %s failed: %s", tag, last_error)
+                        break
+                    raw_text = self._extract_text(resp.json())
+                    decision = parse_decision(raw_text)
+                    self.consecutive_failures = 0
+                    self.last_model = model
+                    return AIResult(
+                        decision=decision, ok=True, attempts=attempt,
+                        latency_ms=int((time.perf_counter() - started) * 1000), raw_text=raw_text, request=payload,
+                    )
+                except httpx.TimeoutException as exc:
+                    last_error = f"[{model}] {type(exc).__name__}: AI không trả lời trong {self.timeout:.0f}s"
+                    log.warning("AI call %s failed: %s", tag, last_error)
+                except (httpx.TransportError, httpx.HTTPStatusError) as exc:
+                    last_error = f"[{model}] {type(exc).__name__}: {exc}"
+                    log.warning("AI call %s failed: %s", tag, last_error)
+                except (ValueError, ValidationError) as exc:
+                    # JSON/Schema sai – thử lại (LLM có tính ngẫu nhiên)
+                    last_error = f"[{model}] invalid AI output: {exc}".replace("\n", " ")[:400]
+                    log.warning("AI output invalid (%s): %s", tag, last_error)
+                if switch:
+                    log.info("AI model %s hết quota/quá tải -> chuyển sang %s", model, self.models[mi + 1])
                     break
-                raw_text = self._extract_text(resp.json())
-                decision = parse_decision(raw_text)
-                self.consecutive_failures = 0
-                return AIResult(
-                    decision=decision, ok=True, attempts=attempt,
-                    latency_ms=int((time.perf_counter() - started) * 1000), raw_text=raw_text, request=payload,
-                )
-            except httpx.TimeoutException as exc:
-                last_error = f"{type(exc).__name__}: AI không trả lời trong {self.timeout:.0f}s"
-                log.warning("AI call attempt %d/%d failed: %s", attempt, self.max_retries, last_error)
-            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                log.warning("AI call attempt %d/%d failed: %s", attempt, self.max_retries, last_error)
-            except (ValueError, ValidationError) as exc:
-                # JSON/Schema sai – thử lại (LLM có tính ngẫu nhiên)
-                last_error = f"invalid AI output: {exc}".replace("\n", " ")[:400]
-                log.warning("AI output invalid (attempt %d/%d): %s", attempt, self.max_retries, last_error)
-            if attempt < self.max_retries:
-                await asyncio.sleep(self._backoff(attempt, retry_after))
+                if try_no < self.max_retries:
+                    await asyncio.sleep(self._backoff(try_no, retry_after))
 
         self.consecutive_failures += 1
         return AIResult(

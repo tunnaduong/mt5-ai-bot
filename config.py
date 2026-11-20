@@ -35,6 +35,8 @@ class Settings(BaseSettings):
     ai_endpoint_url: str = "https://api.openai.com/v1/chat/completions"
     ai_api_key: SecretStr = SecretStr("")
     ai_model: str = "gpt-4o-mini"
+    # Model dự phòng (phân tách bằng dấu phẩy), dùng khi model chính bị 429/503/timeout
+    ai_fallback_models: str = ""
     ai_api_style: Literal["openai", "custom"] = "openai"
     ai_timeout_sec: float = Field(60.0, gt=0)
     ai_max_retries: int = Field(2, ge=1, le=10)

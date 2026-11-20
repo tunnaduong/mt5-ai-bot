@@ -169,3 +169,28 @@ async def test_json_mode_off():
 
     await make_client(handler, json_mode=False).decide(SNAPSHOT)
     assert "response_format" not in seen["body"]
+
+
+async def test_quota_error_switches_to_fallback_model_immediately():
+    seen: list[str] = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        model = json.loads(req.content)["model"]
+        seen.append(model)
+        if model == "m":
+            return httpx.Response(429, json={"error": "quota"})
+        return httpx.Response(200, json=openai_body(json.dumps(GOOD)))
+
+    c = make_client(handler, fallback_models=["lite"])
+    r = await c.decide(SNAPSHOT)
+    assert r.ok and r.decision.action is Action.BUY
+    assert seen == ["m", "lite"]  # không retry model chính khi 429
+    assert c.last_model == "lite"
+
+
+async def test_all_models_fail_hold_with_model_in_error():
+    c = make_client(lambda r: httpx.Response(503), fallback_models=["lite"], max_retries=2)
+    r = await c.decide(SNAPSHOT)
+    assert not r.ok and r.decision.action is Action.HOLD
+    assert r.attempts == 3  # m (1, chuyển ngay) + lite (2 lần)
+    assert "[lite]" in r.error
