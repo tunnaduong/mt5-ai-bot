@@ -36,8 +36,8 @@ class Settings(BaseSettings):
     ai_api_key: SecretStr = SecretStr("")
     ai_model: str = "gpt-4o-mini"
     ai_api_style: Literal["openai", "custom"] = "openai"
-    ai_timeout_sec: float = Field(30.0, gt=0)
-    ai_max_retries: int = Field(3, ge=1, le=10)
+    ai_timeout_sec: float = Field(60.0, gt=0)
+    ai_max_retries: int = Field(2, ge=1, le=10)
     ai_temperature: float = Field(0.2, ge=0, le=2)
     ai_json_mode: bool = True  # gửi response_format={"type":"json_object"} (OpenAI-compatible)
     ai_failure_alert_threshold: int = Field(3, ge=1)

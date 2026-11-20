@@ -350,6 +350,7 @@ class TradingBot:
             await self._close_symbol_positions(ctx, d.reasoning)
             return
 
+        await self._refresh_market(ctx)
         proposal = await self._evaluate(ctx, result)
         if not proposal.approved:
             if d.confidence >= self.s.notify_min_confidence:
@@ -382,6 +383,13 @@ class TradingBot:
             self.tg.notify(f"❌ <b>Lệnh {esc(ctx.symbol)} {proposal.side.value} thất bại</b>\n"
                            f"retcode {res.retcode}: {esc(res.comment)}")
             self.db.log_event("ERROR", "order", f"{ctx.symbol} retcode={res.retcode} {res.comment}")
+
+    async def _refresh_market(self, ctx: SymbolContext) -> None:
+        """Cập nhật lại giá/tài khoản/vị thế sau khi chờ AI (có thể mất hàng chục giây)."""
+        ctx.tick = await self.mt5.tick(ctx.symbol)
+        ctx.tick_age = self._tick_age(ctx.tick)
+        ctx.account = await self.mt5.account()
+        ctx.positions = await self.mt5.positions()
 
     async def _close_symbol_positions(self, ctx: SymbolContext, reason: str) -> None:
         if not ctx.bot_positions:

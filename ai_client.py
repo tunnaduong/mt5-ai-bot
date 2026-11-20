@@ -183,6 +183,7 @@ class AIClient:
         self.system_prompt = system_prompt or build_system_prompt("English", 1.2, 0.3, 5.0)
         self.backoff_base = backoff_base
         self.backoff_max = backoff_max
+        self.timeout = timeout
         self.consecutive_failures = 0
         headers = {"Content-Type": "application/json"}
         if api_key:
@@ -252,7 +253,10 @@ class AIClient:
                     decision=decision, ok=True, attempts=attempt,
                     latency_ms=int((time.perf_counter() - started) * 1000), raw_text=raw_text, request=payload,
                 )
-            except (httpx.TimeoutException, httpx.TransportError, httpx.HTTPStatusError) as exc:
+            except httpx.TimeoutException as exc:
+                last_error = f"{type(exc).__name__}: AI không trả lời trong {self.timeout:.0f}s"
+                log.warning("AI call attempt %d/%d failed: %s", attempt, self.max_retries, last_error)
+            except (httpx.TransportError, httpx.HTTPStatusError) as exc:
                 last_error = f"{type(exc).__name__}: {exc}"
                 log.warning("AI call attempt %d/%d failed: %s", attempt, self.max_retries, last_error)
             except (ValueError, ValidationError) as exc:

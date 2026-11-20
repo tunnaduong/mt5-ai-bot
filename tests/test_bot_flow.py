@@ -162,3 +162,21 @@ async def test_small_account_snapshot_has_affordable_sl():
     # 0.01 lot EURUSD lỗ $1000 cho mỗi 1.0 giá; trần 5% của $100 = $5 -> SL tối đa 0.005 (50 pips)
     assert ctx.snapshot["risk_rules"]["max_affordable_sl_distance"] == pytest.approx(0.005)
     assert ctx.snapshot["risk_rules"]["max_risk_pct_per_trade"] == 5
+
+
+async def test_market_refreshed_after_ai_reply():
+    """Giá dùng cho risk check phải là giá sau khi AI trả lời, không phải giá lúc gửi snapshot."""
+    bot, mt5, _ = make_bot(BUY)
+    ctx = await bot.build_context("EURUSD")
+    seen = []
+    orig_tick = mt5.tick
+
+    async def moved_tick(s):
+        t = await orig_tick(s)
+        seen.append(1)
+        return Tick(s, t.bid + 0.001, t.ask + 0.001, t.time + 60)
+
+    mt5.tick = moved_tick
+    result = await bot._ask_ai(ctx)
+    await bot._act(ctx, result)
+    assert seen and ctx.tick.bid == pytest.approx(1.111)
