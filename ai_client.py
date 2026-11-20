@@ -128,6 +128,22 @@ def build_system_prompt(language: str, min_rr: float, min_sl_atr: float, max_sl_
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+# "\u" không theo sau bởi đúng 4 ký tự hex (LLM đôi khi viết hỏng escape tiếng Việt)
+_BAD_U_ESCAPE_RE = re.compile(r"(?<!\\)((?:\\\\)*)\\u(?![0-9a-fA-F]{4})")
+# backslash trước ký tự không hợp lệ trong JSON (vd "\đ", "\ ")
+_BAD_ESCAPE_RE = re.compile(r'(?<!\\)((?:\\\\)*)\\(?!["\\/bfnrtu])')
+
+
+def _repair_escapes(s: str) -> str:
+    s = _BAD_U_ESCAPE_RE.sub(lambda m: m.group(1) + "\\\\u", s)
+    return _BAD_ESCAPE_RE.sub(lambda m: m.group(1) + "\\\\", s)
+
+
+def _loads_lenient(s: str) -> Any:
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        return json.loads(_repair_escapes(s), strict=False)
 
 
 def extract_json(text: str) -> dict[str, Any]:
@@ -139,12 +155,12 @@ def extract_json(text: str) -> dict[str, Any]:
     if m:
         candidate = m.group(1).strip()
     try:
-        obj = json.loads(candidate)
+        obj = _loads_lenient(candidate)
     except json.JSONDecodeError:
         start, end = candidate.find("{"), candidate.rfind("}")
         if start == -1 or end <= start:
             raise ValueError("no JSON object found in response") from None
-        obj = json.loads(candidate[start : end + 1])
+        obj = _loads_lenient(candidate[start : end + 1])
     if not isinstance(obj, dict):
         raise ValueError("JSON root is not an object")
     return obj

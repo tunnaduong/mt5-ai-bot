@@ -194,3 +194,13 @@ async def test_all_models_fail_hold_with_model_in_error():
     assert not r.ok and r.decision.action is Action.HOLD
     assert r.attempts == 3  # m (1, chuyển ngay) + lite (2 lần)
     assert "[lite]" in r.error
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ('{"action":"HOLD","confidence":0.5,"reasoning":"Gi\\u1ea3m m\\u1ea1nh"}', "Giảm mạnh"),  # escape đúng
+    ('{"action":"HOLD","confidence":0.5,"reasoning":"Gi\\u1ea m\\u"}', "Gi\\u1ea m\\u"),       # \\u hỏng
+    ('{"action":"HOLD","confidence":0.5,"reasoning":"giá \\đang giảm"}', "giá \\đang giảm"),  # escape lạ
+    ('{"action":"HOLD","confidence":0.5,"reasoning":"dòng 1\ndòng 2"}', "dòng 1\ndòng 2"),    # xuống dòng thô
+])
+def test_parse_repairs_broken_escapes(raw, expected):
+    assert parse_decision(raw).reasoning == expected
