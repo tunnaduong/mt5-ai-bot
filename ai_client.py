@@ -112,6 +112,8 @@ Rules:
 - If an open position already exists on the symbol, prefer HOLD unless CLOSE is justified.
 - If signals conflict, spread is wide, or data is insufficient: HOLD with low confidence.
 - Never invent data that is not in the snapshot. Confidence must reflect real conviction.
+- Write "reasoning" in natural {language} with full, correct diacritics/accents
+  (for Vietnamese: "Xu hướng giảm mạnh", NEVER "Xu huong giam manh"). Do not wrap the JSON in markdown.
 """
 
 
