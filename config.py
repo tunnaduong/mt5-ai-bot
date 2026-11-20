@@ -62,6 +62,16 @@ class Settings(BaseSettings):
     notify_min_confidence: float = Field(0.6, ge=0, le=1)
     daily_summary_hour_utc: int = Field(21, ge=0, le=23)
 
+    # ---------------- Scalp (lướt sóng khung ngắn, vào lệnh bằng nút Telegram) ----------------
+    scalp_enabled: bool = False  # có thể bật/tắt lúc chạy bằng /scalp on|off
+    scalp_symbols: str = ""  # rỗng = dùng SYMBOLS
+    scalp_timeframe: str = "M5"
+    scalp_context_timeframes: str = "M15,H1"
+    scalp_min_confidence: float = Field(0.6, ge=0, le=1)  # AI phải tự tin >= mức này mới gửi tín hiệu
+    scalp_signal_ttl_sec: int = Field(180, ge=15, le=3600)  # nút hết hạn sau N giây
+    scalp_risk_per_trade_pct: float = Field(0.0, ge=0, le=5)  # 0 = dùng RISK_PER_TRADE_PCT
+    scalp_sl_atr_mult: float = Field(1.5, gt=0)  # SL mặc định (x ATR) khi AI không đưa SL (/scalp SYMBOL)
+
     # ---------------- Risk ----------------
     risk_per_trade_pct: float = Field(0.5, gt=0, le=5)
     max_open_positions: int = Field(3, ge=1)
@@ -86,7 +96,7 @@ class Settings(BaseSettings):
     log_dir: str = "logs"
     log_level: str = "INFO"
 
-    @field_validator("timeframe")
+    @field_validator("timeframe", "scalp_timeframe")
     @classmethod
     def _upper_tf(cls, v: str) -> str:
         return v.strip().upper()
@@ -105,6 +115,14 @@ class Settings(BaseSettings):
     @property
     def context_timeframe_list(self) -> list[str]:
         return [tf.upper() for tf in _split_csv(self.context_timeframes)]
+
+    @property
+    def scalp_symbol_list(self) -> list[str]:
+        return _split_csv(self.scalp_symbols) or self.symbol_list
+
+    @property
+    def scalp_context_timeframe_list(self) -> list[str]:
+        return [tf.upper() for tf in _split_csv(self.scalp_context_timeframes)]
 
     @property
     def spread_overrides(self) -> dict[str, float]:

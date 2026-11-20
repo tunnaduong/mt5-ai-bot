@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import dataclasses
+import secrets
 import logging
 import signal
 import sys
@@ -22,7 +24,7 @@ from typing import Any, Awaitable, Callable
 
 import pandas as pd
 
-from ai_client import Action, AIClient, AIResult, build_system_prompt
+from ai_client import Action, AIClient, AIDecision, AIResult, build_system_prompt
 from config import Settings, get_settings
 from indicators import latest_atr, summarize
 from models import AccountState, Position, Side, SymbolSpec, Tick
@@ -32,6 +34,20 @@ from storage import Storage, utc_now
 from telegram_bot import NullNotifier, TelegramNotifier, esc
 
 log = logging.getLogger("bot")
+
+
+@dataclass
+class ScalpSignal:
+    """Tín hiệu lướt sóng đang chờ người dùng bấm nút trên Telegram."""
+
+    id: str
+    symbol: str
+    ai_side: Side | None  # hướng AI gợi ý (None = AI HOLD, người dùng tự chọn)
+    sl_dist: float  # khoảng cách SL (giá) – áp cho cả LONG lẫn SHORT
+    tp_dist: float
+    atr: float | None
+    confidence: float
+    expires_at: float
 
 
 @dataclass
@@ -74,6 +90,11 @@ class TradingBot:
         self._loss_alert_day: str | None = None
         self._trade_lock = asyncio.Lock()
         self.started_at = time.time()
+        self.scalp_risk = RiskManager(build_scalp_risk_config(settings))
+        self._scalp_last_bar: dict[str, int] = {}
+        self._scalp_signals: dict[str, ScalpSignal] = {}
+        saved = self.db.get_kv("scalp_enabled")
+        self._scalp_enabled = settings.scalp_enabled if saved is None else saved == "1"
 
     # ================================================================== controller API
     @property
@@ -126,6 +147,8 @@ class TradingBot:
             f"Lệnh đã đóng hôm nay: {stats['trades']} | Realized: {stats['pnl']:+,.2f}\n"
             f"Vị thế mở: {len(positions)}\n"
             f"Symbols: {esc(', '.join(self.s.symbol_list))} | TF: {self.s.timeframe}\n"
+            f"Lướt sóng: {'🟢 BẬT' if self._scalp_enabled else '⚪ TẮT'} "
+            f"({esc(', '.join(self.s.scalp_symbol_list))} {self.s.scalp_timeframe})\n"
             f"AI lỗi liên tiếp: {self.ai.consecutive_failures} | Uptime: {uptime_h:.1f}h"
         )
 
@@ -238,16 +261,21 @@ class TradingBot:
             return 0.0
         return now - prev[1]
 
-    async def build_context(self, symbol: str, main_df: pd.DataFrame | None = None) -> SymbolContext:
+    async def build_context(
+        self, symbol: str, main_df: pd.DataFrame | None = None,
+        timeframe: str | None = None, context_tfs: list[str] | None = None,
+    ) -> SymbolContext:
+        main_tf = timeframe or self.s.timeframe
+        context_tfs = self.s.context_timeframe_list if context_tfs is None else context_tfs
         spec = await self.mt5.symbol_spec(symbol)
         tick = await self.mt5.tick(symbol)
         account = await self.mt5.account()
         positions = await self.mt5.positions()
         if main_df is None:
-            main_df = await self.mt5.bars(symbol, self.s.timeframe, self.s.bars_count)
-        timeframes = {self.s.timeframe: summarize(main_df, self.s.timeframe, spec.digits)}
-        for tf in self.s.context_timeframe_list:
-            if tf == self.s.timeframe:
+            main_df = await self.mt5.bars(symbol, main_tf, self.s.bars_count)
+        timeframes = {main_tf: summarize(main_df, main_tf, spec.digits)}
+        for tf in context_tfs:
+            if tf == main_tf:
                 continue
             try:
                 timeframes[tf] = summarize(await self.mt5.bars(symbol, tf, self.s.bars_count), tf, spec.digits, 3)
@@ -263,7 +291,7 @@ class TradingBot:
             "digits": spec.digits,
             "price": {"bid": tick.bid, "ask": tick.ask, "spread_points": tick.spread_points(spec.point)},
             "broker_min_stop_distance": round(spec.min_stop_distance, spec.digits),
-            "main_timeframe": self.s.timeframe,
+            "main_timeframe": main_tf,
             "timeframes": timeframes,
             "open_positions": [
                 {"ticket": p.ticket, "side": p.side.value, "volume": p.volume, "price_open": p.price_open,
@@ -404,6 +432,140 @@ class TradingBot:
                 self.tg.notify(f"{status} #{p.ticket} {esc(p.symbol)} – P&amp;L hiện tại {p.profit:+.2f}\n"
                                f"💬 {esc(reason[:300])}" + ("" if res.success else f"\n{res.retcode} {esc(res.comment)}"))
 
+    # ================================================================== scalp (lướt sóng)
+    @property
+    def scalp_enabled(self) -> bool:
+        return self._scalp_enabled
+
+    def set_scalp(self, enabled: bool) -> None:
+        self._scalp_enabled = enabled
+        self.db.set_kv("scalp_enabled", "1" if enabled else "0")
+        self.db.log_event("INFO", "control", f"scalp {'on' if enabled else 'off'}")
+        log.info("Scalp mode %s", "ON" if enabled else "OFF")
+
+    async def scalp_once(self, force: bool = False) -> None:
+        """Mỗi nến mới của SCALP_TIMEFRAME: hỏi AI, nếu có tín hiệu thì gửi nút LONG/SHORT/Bỏ qua."""
+        if not self._scalp_enabled or self._paused or not self.mt5.connected:
+            return
+        now = time.monotonic()
+        self._scalp_signals = {k: v for k, v in self._scalp_signals.items() if v.expires_at > now}
+        for symbol in self.s.scalp_symbol_list:
+            try:
+                df = await self.mt5.bars(symbol, self.s.scalp_timeframe, self.s.bars_count)
+                bar_time = int(df["time"].iloc[-1])
+                if not force and self._scalp_last_bar.get(symbol) == bar_time:
+                    continue
+                self._scalp_last_bar[symbol] = bar_time
+                await self.scalp_signal(symbol, main_df=df, manual=False)
+            except MT5Error as exc:
+                log.error("%s: scalp lỗi MT5: %s", symbol, exc)
+            except Exception:  # noqa: BLE001
+                log.exception("%s: scalp lỗi không mong đợi", symbol)
+
+    async def scalp_signal(self, symbol: str, main_df: pd.DataFrame | None = None, manual: bool = True) -> str | None:
+        """Phân tích khung ngắn và gửi tín hiệu kèm nút. `manual`: luôn gửi nút kể cả khi AI HOLD.
+
+        Trả về text lỗi/thông báo (cho lệnh /scalp SYMBOL) hoặc None nếu đã gửi tín hiệu / không có gì.
+        """
+        ctx = await self.build_context(symbol, main_df, self.s.scalp_timeframe, self.s.scalp_context_timeframe_list)
+        ctx.snapshot["trading_style"] = (
+            f"SCALPING on {self.s.scalp_timeframe}: short holding time, tight structure-based stop, "
+            "quick realistic take-profit. Only BUY/SELL on a clear short-term edge."
+        )
+        result = await self._ask_ai(ctx)
+        d = result.decision
+        ai_side = Side(d.action.value) if d.action in (Action.BUY, Action.SELL) else None
+        if not manual and (ai_side is None or d.confidence < self.s.scalp_min_confidence):
+            return None
+
+        entry = ctx.tick.ask if ai_side is Side.BUY else ctx.tick.bid
+        sl_dist = abs(entry - d.stop_loss) if ai_side and d.stop_loss else 0.0
+        tp_dist = abs(d.take_profit - entry) if ai_side and d.take_profit else 0.0
+        if sl_dist <= 0:
+            if not ctx.atr:
+                return f"❌ {esc(symbol)}: không đủ dữ liệu ATR để đặt SL."
+            sl_dist = ctx.atr * self.s.scalp_sl_atr_mult
+        if tp_dist <= 0:
+            tp_dist = sl_dist * max(self.s.min_rr, 1.5)
+
+        sig = ScalpSignal(secrets.token_hex(4), symbol, ai_side, sl_dist, tp_dist, ctx.atr, d.confidence,
+                          time.monotonic() + self.s.scalp_signal_ttl_sec)
+        # Xem trước lot/rủi ro theo hướng AI (hoặc LONG nếu AI HOLD)
+        preview = await self._scalp_proposal(ctx, sig, ai_side or Side.BUY)
+        if not manual and not preview.approved:
+            log.info("SCALP %s %s bị risk chặn – không gửi nút: %s", symbol, ai_side, "; ".join(preview.reasons))
+            return None
+        self._scalp_signals[sig.id] = sig
+
+        d_ = ctx.spec.digits
+        star = {Side.BUY: "🟢 LONG", Side.SELL: "🔴 SHORT", None: "⏸ HOLD (chưa rõ xu hướng)"}[ai_side]
+        lines = [
+            f"⚡ <b>LƯỚT SÓNG {esc(symbol)}</b> ({self.s.scalp_timeframe}) – AI gợi ý: <b>{star}</b> "
+            f"(conf {d.confidence:.2f})" + (" ⚠️ AI lỗi" if result.is_fallback else ""),
+            f"Giá: bid {ctx.tick.bid} / ask {ctx.tick.ask}",
+            f"SL cách {round(sl_dist, d_)} | TP cách {round(tp_dist, d_)} (R:R {tp_dist / sl_dist:.2f})",
+        ]
+        if preview.approved:
+            lines.append(f"Lot {preview.volume} | rủi ro {preview.risk_amount} {ctx.account.currency} "
+                         f"({preview.risk_pct}%)")
+        else:
+            lines.append("⚠️ Risk hiện đang chặn: " + esc("; ".join(preview.reasons)))
+        lines += [f"💬 {esc(d.reasoning[:300])}",
+                  f"<i>Bấm trong {self.s.scalp_signal_ttl_sec}s. Giá vào lệnh = giá lúc bấm, SL/TP giữ khoảng cách trên.</i>"]
+        self.tg.notify_scalp("\n".join(lines), sig.id, ai_side.value if ai_side else None)
+        return None
+
+    async def _scalp_proposal(self, ctx: SymbolContext, sig: ScalpSignal, side: Side):
+        entry = ctx.tick.ask if side is Side.BUY else ctx.tick.bid
+        sign = 1 if side is Side.BUY else -1
+        digits = ctx.spec.digits
+        decision = AIDecision(
+            action=Action(side.value), confidence=max(sig.confidence, 0.01),
+            stop_loss=round(entry - sign * sig.sl_dist, digits), take_profit=round(entry + sign * sig.tp_dist, digits),
+            reasoning="scalp",
+        )
+        return await self.scalp_risk.evaluate(
+            decision, ctx.spec, ctx.tick, ctx.account, ctx.positions, ctx.day_start_balance, sig.atr, ctx.tick_age,
+            loss_per_lot_fn=lambda s_, e, sl: self.mt5.loss_per_lot(ctx.symbol, s_, e, sl),
+            margin_fn=lambda s_, v, pr: self.mt5.margin_required(ctx.symbol, s_, v, pr),
+        )
+
+    async def execute_scalp(self, signal_id: str, choice: str) -> str:
+        """Xử lý nút Telegram: choice = BUY | SELL | SKIP."""
+        sig = self._scalp_signals.pop(signal_id, None)
+        if sig is None or sig.expires_at < time.monotonic():
+            return "⌛ Tín hiệu đã hết hạn hoặc đã xử lý."
+        if choice == "SKIP":
+            return f"❎ Đã bỏ qua tín hiệu {esc(sig.symbol)}."
+        if self._paused:
+            return "⏸ Bot đang tạm dừng (/resume để mở lệnh)."
+        side = Side(choice)
+        async with self._trade_lock:
+            spec = await self.mt5.symbol_spec(sig.symbol)
+            tick = await self.mt5.tick(sig.symbol)
+            account = await self.mt5.account()
+            positions = await self.mt5.positions()
+            ctx = SymbolContext(sig.symbol, spec, tick, account, positions,
+                                [p for p in positions if p.symbol == sig.symbol and p.magic == self.mt5.magic],
+                                sig.atr, self._tick_age(tick), await self.day_start_balance(account))
+            p = await self._scalp_proposal(ctx, sig, side)
+            self.db.log_risk(sig.symbol, f"SCALP_{side.value}", sig.confidence, p.approved, p.volume, p.entry,
+                             p.sl, p.tp, p.risk_amount, p.rr, p.reasons)
+            if not p.approved:
+                return f"🛡 <b>Risk BLOCK</b> {esc(sig.symbol)} {side.value}\n• " + "\n• ".join(esc(r) for r in p.reasons)
+            assert p.sl
+            res = await self.mt5.open_position(spec, side, p.volume, p.sl, p.tp, comment="scalp tg")
+        self.db.log_order(sig.symbol, side.value, p.volume, res.price, p.sl, p.tp, res.dry_run, res.success,
+                          res.retcode, res.comment, res.ticket, res.request)
+        if not res.success:
+            self.db.log_event("ERROR", "order", f"scalp {sig.symbol} retcode={res.retcode} {res.comment}")
+            return f"❌ <b>Lệnh {esc(sig.symbol)} {side.value} thất bại</b>\nretcode {res.retcode}: {esc(res.comment)}"
+        tag = "🧪 DRY-RUN (order_check OK, không gửi lệnh)" if res.dry_run else "✅ ĐÃ VÀO LỆNH"
+        return (f"{tag} ⚡\n<b>{esc(sig.symbol)} {'LONG' if side is Side.BUY else 'SHORT'}</b> {p.volume} lot @ {res.price}\n"
+                f"SL {p.sl} | TP {p.tp} | R:R {p.rr}\n"
+                f"Rủi ro: {p.risk_amount} {account.currency} ({p.risk_pct}%)"
+                + (f"\nTicket #{res.ticket}" if res.ticket else ""))
+
     # ================================================================== monitoring
     async def monitor_once(self) -> None:
         """Kiểm tra kết nối, theo dõi lệnh đóng (SL/TP), daily loss, sức khoẻ AI, báo cáo cuối ngày."""
@@ -518,6 +680,7 @@ class TradingBot:
         await asyncio.gather(
             self._loop("monitor", self.monitor_once, self.s.monitor_interval_sec, stop),
             self._loop("trading", self.trading_once, self.s.loop_interval_sec, stop),
+            self._loop("scalp", self.scalp_once, self.s.loop_interval_sec, stop),
         )
 
 
@@ -561,6 +724,14 @@ def build_risk_config(s: Settings) -> RiskConfig:
         sl_fallback_atr_mult=s.sl_fallback_atr_mult, max_tick_age_sec=s.max_tick_age_sec,
         max_margin_usage_pct=s.max_margin_usage_pct, max_lot_cap=s.max_lot_cap,
         min_lot_max_risk_pct=s.min_lot_max_risk_pct,
+    )
+
+
+def build_scalp_risk_config(s: Settings) -> RiskConfig:
+    """Risk cho lệnh lướt sóng: người dùng tự bấm nên bỏ ngưỡng confidence, có thể dùng % rủi ro riêng."""
+    return dataclasses.replace(
+        build_risk_config(s), min_confidence=0.0,
+        risk_per_trade_pct=s.scalp_risk_per_trade_pct or s.risk_per_trade_pct,
     )
 
 

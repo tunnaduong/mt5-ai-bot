@@ -42,6 +42,11 @@ class BotController(Protocol):
     async def stats_text(self, days: int | None = 30) -> str: ...
     async def close_all_positions(self) -> str: ...
     async def analyze_text(self, symbol: str) -> str: ...
+    @property
+    def scalp_enabled(self) -> bool: ...
+    def set_scalp(self, enabled: bool) -> None: ...
+    async def scalp_signal(self, symbol: str) -> str | None: ...
+    async def execute_scalp(self, signal_id: str, choice: str) -> str: ...
 
 
 class TelegramNotifier:
@@ -78,6 +83,7 @@ class TelegramNotifier:
                     BotCommand("resume", "Tiếp tục mở lệnh mới"),
                     BotCommand("close_all", "Đóng toàn bộ vị thế (có xác nhận)"),
                     BotCommand("analyze", "Phân tích AI ngay: /analyze GOLD"),
+                    BotCommand("scalp", "Lướt sóng: /scalp on|off hoặc /scalp GOLD"),
                     BotCommand("help", "Hướng dẫn"),
                 ])
             except TelegramError as exc:
@@ -112,6 +118,16 @@ class TelegramNotifier:
                 self._queue.put_nowait((chunk, keyboard if i == len(chunks) - 1 else None))
             except asyncio.QueueFull:
                 log.error("Telegram queue đầy – bỏ tin: %s", chunk[:80])
+
+    def notify_scalp(self, text: str, signal_id: str, ai_side: str | None) -> None:
+        """Tín hiệu lướt sóng kèm nút LONG / SHORT / Bỏ qua (⭐ = hướng AI gợi ý)."""
+        star = {"BUY": ("⭐ ", ""), "SELL": ("", "⭐ ")}.get(ai_side or "", ("", ""))
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"{star[0]}🟢 LONG", callback_data=f"scalp:BUY:{signal_id}"),
+             InlineKeyboardButton(f"{star[1]}🔴 SHORT", callback_data=f"scalp:SELL:{signal_id}")],
+            [InlineKeyboardButton("❌ Bỏ qua", callback_data=f"scalp:SKIP:{signal_id}")],
+        ])
+        self.notify(text, kb)
 
     async def _sender_loop(self) -> None:
         last_sent = 0.0
@@ -152,11 +168,12 @@ class TelegramNotifier:
         commands = {
             "start": self._cmd_help, "help": self._cmd_help, "status": self._cmd_status,
             "positions": self._cmd_positions, "stats": self._cmd_stats, "pause": self._cmd_pause, "resume": self._cmd_resume,
-            "close_all": self._cmd_close_all, "analyze": self._cmd_analyze,
+            "close_all": self._cmd_close_all, "analyze": self._cmd_analyze, "scalp": self._cmd_scalp,
         }
         for name, handler in commands.items():
             self.app.add_handler(CommandHandler(name, handler, filters=admin))
         self.app.add_handler(CallbackQueryHandler(self._on_callback, pattern=r"^closeall:"))
+        self.app.add_handler(CallbackQueryHandler(self._on_scalp_callback, pattern=r"^scalp:"))
         # Mọi thứ không phải từ admin -> log và bỏ qua (không trả lời để không lộ bot)
         self.app.add_handler(MessageHandler(~admin, self._on_unauthorized), group=1)
         self.app.add_error_handler(self._on_error)
@@ -195,7 +212,9 @@ class TelegramNotifier:
             "/pause – tạm dừng mở lệnh mới\n"
             "/resume – tiếp tục\n"
             "/close_all – đóng toàn bộ vị thế (có xác nhận)\n"
-            "/analyze &lt;SYMBOL&gt; – phân tích AI ngay (không vào lệnh)"
+            "/analyze &lt;SYMBOL&gt; – phân tích AI ngay (không vào lệnh)\n"
+            "/scalp on|off – bật/tắt tín hiệu lướt sóng khung ngắn (có nút LONG/SHORT/Bỏ qua)\n"
+            "/scalp &lt;SYMBOL&gt; – lấy tín hiệu lướt sóng ngay"
         ))
 
     async def _cmd_status(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
@@ -264,6 +283,50 @@ class TelegramNotifier:
         await self._reply(update, f"🔎 Đang phân tích <b>{esc(symbol)}</b>...")
         await self._reply(update, await self._ctrl().analyze_text(symbol))
 
+    async def _cmd_scalp(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        ctrl = self._ctrl()
+        arg = (context.args or [""])[0].strip()
+        if arg.lower() in ("on", "off"):
+            ctrl.set_scalp(arg.lower() == "on")
+            await self._reply(update, "⚡ Lướt sóng: <b>BẬT</b> – bot sẽ gửi tín hiệu kèm nút mỗi nến mới."
+                              if arg.lower() == "on" else "⚡ Lướt sóng: <b>TẮT</b>.")
+            return
+        if not arg:
+            state = "BẬT" if ctrl.scalp_enabled else "TẮT"
+            await self._reply(update, f"⚡ Lướt sóng đang <b>{state}</b>.\n"
+                              "Cú pháp: <code>/scalp on</code>, <code>/scalp off</code>, <code>/scalp GOLD</code>")
+            return
+        if len(arg) > 32 or not all(c.isalnum() or c in "._#-" for c in arg):
+            await self._reply(update, "Cú pháp: <code>/scalp GOLD</code>")
+            return
+        await self._reply(update, f"⚡ Đang phân tích lướt sóng <b>{esc(arg)}</b>...")
+        try:
+            msg = await ctrl.scalp_signal(arg)
+        except Exception as exc:  # noqa: BLE001
+            msg = f"❌ {esc(exc)}"
+        if msg:
+            await self._reply(update, msg)
+
+    async def _on_scalp_callback(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
+        query = update.callback_query
+        if query is None:
+            return
+        if not self._is_admin(update):
+            await query.answer("Không có quyền.", show_alert=True)
+            log.warning("Scalp callback từ chat lạ bị từ chối: %s", update.effective_chat)
+            return
+        _, choice, signal_id = (query.data or "::").split(":", 2)
+        await query.answer()
+        original = query.message.text_html if query.message and query.message.text else ""
+        if choice != "SKIP":
+            await query.edit_message_text(f"{original}\n\n⏳ Đang vào lệnh {choice}...", parse_mode=ParseMode.HTML)
+        try:
+            result = await self._ctrl().execute_scalp(signal_id, choice)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("execute_scalp lỗi")
+            result = f"❌ Lỗi: {esc(exc)}"
+        await query.edit_message_text(f"{original}\n\n{result}"[-MAX_LEN:], parse_mode=ParseMode.HTML)
+
 
 class NullNotifier:
     """Dùng khi không cấu hình Telegram – chỉ log ra console."""
@@ -282,3 +345,6 @@ class NullNotifier:
 
     def notify(self, text: str, keyboard: object = None) -> None:
         log.info("[notify] %s", html.unescape(text).replace("<b>", "").replace("</b>", ""))
+
+    def notify_scalp(self, text: str, signal_id: str, ai_side: str | None) -> None:
+        self.notify(text + "\n(Telegram tắt – không có nút bấm)")

@@ -152,6 +152,8 @@ Dừng bot: `Ctrl+C` – bot gửi nốt tin Telegram trong hàng đợi, đóng
 | `/pause`, `/resume` | Dừng/tiếp tục **mở lệnh mới** (monitor SL/TP vẫn chạy; khi pause bot không gọi AI) |
 | `/close_all` | Đóng mọi vị thế, cần bấm **Confirm** trong 60 giây |
 | `/analyze GOLD` | Chạy AI ngay + chỉ báo + risk check thử – **không vào lệnh** |
+| `/scalp on` / `/scalp off` | Bật/tắt chế độ **lướt sóng** (xem mục 12) |
+| `/scalp GOLD` | Lấy tín hiệu lướt sóng ngay, kèm nút LONG / SHORT / Bỏ qua |
 
 Thông báo tự động: vào lệnh, đóng lệnh (lý do SL/TP/manual/stop-out, P&L $, % balance), risk block
 (khi confidence ≥ `NOTIFY_MIN_CONFIDENCE`), mất/có lại kết nối MT5, AI lỗi liên tiếp, daily loss limit,
@@ -227,3 +229,47 @@ MAX_MARGIN_USAGE_PCT=60          # đòn bẩy tài khoản thật thấp hơn d
 
 Lưu ý: 10 lệnh thua liên tiếp ở trần 5% ≈ mất 40% tài khoản. Hãy kiểm chứng bằng `/stats` trên
 demo trước (có thể mở 1 tài khoản demo $100 để thử đúng cấu hình này).
+
+
+## 12. Chế độ lướt sóng (scalp) – vào lệnh bằng nút Telegram
+
+Chạy **song song** với chế độ AI tự trade (khung `TIMEFRAME`). Khác biệt: ở chế độ lướt sóng
+**bot KHÔNG tự vào lệnh** – bot chỉ gửi tín hiệu, **bạn bấm nút** mới vào lệnh.
+
+```
+⚡ LƯỚT SÓNG GOLD (M5) – AI gợi ý: 🟢 LONG (conf 0.72)
+Giá: bid 3521.10 / ask 3521.40
+SL cách 4.2 | TP cách 6.3 (R:R 1.50)
+Lot 0.01 | rủi ro 4.2 USD (4.1%)
+💬 Giá bật lên từ hỗ trợ M15, RSI M5 thoát quá bán...
+[⭐ 🟢 LONG] [🔴 SHORT]
+[❌ Bỏ qua]
+```
+
+- Mỗi khi có **nến mới của `SCALP_TIMEFRAME`** (mặc định M5 = 5 phút/lần), AI phân tích khung đó + `SCALP_CONTEXT_TIMEFRAMES`.
+- Chỉ gửi tín hiệu khi AI ra BUY/SELL với confidence ≥ `SCALP_MIN_CONFIDENCE` **và** Risk Manager cho phép.
+- ⭐ đánh dấu hướng AI gợi ý; bạn vẫn có thể bấm hướng ngược lại (SL/TP được lật đối xứng, cùng khoảng cách).
+- Giá vào lệnh = giá **lúc bạn bấm**; SL/TP giữ nguyên khoảng cách. Nút hết hạn sau `SCALP_SIGNAL_TTL_SEC`.
+- Lot và rủi ro vẫn qua **toàn bộ Risk Manager** (spread, daily loss, số lệnh tối đa, margin...);
+  chỉ bỏ ngưỡng `MIN_CONFIDENCE` vì là quyết định của bạn. Nếu bị chặn, bot trả lời lý do.
+- `/scalp GOLD`: hỏi ngay, **luôn** gửi nút kể cả khi AI HOLD (khi đó SL = `SCALP_SL_ATR_MULT` × ATR, TP = SL × max(MIN_RR, 1.5)).
+- Trạng thái bật/tắt được lưu lại, khởi động lại bot vẫn giữ.
+
+```ini
+SCALP_ENABLED=false            # hoặc bật bằng /scalp on
+SCALP_SYMBOLS=GOLD,BITCOIN     # rỗng = dùng SYMBOLS
+SCALP_TIMEFRAME=M5             # M1 = rất nhiều tín hiệu + tốn quota AI gấp 5 lần
+SCALP_CONTEXT_TIMEFRAMES=M15,H1
+SCALP_MIN_CONFIDENCE=0.6
+SCALP_SIGNAL_TTL_SEC=180
+SCALP_RISK_PER_TRADE_PCT=0     # 0 = dùng RISK_PER_TRADE_PCT
+SCALP_SL_ATR_MULT=1.5
+```
+
+> ⚠️ Nếu mã đó đã có lệnh của chế độ tự trade, `MAX_POSITIONS_PER_SYMBOL=1` sẽ chặn lệnh lướt sóng.
+> Muốn chạy cả hai cùng lúc: tăng `MAX_POSITIONS_PER_SYMBOL` (và `MAX_OPEN_POSITIONS`).
+>
+> ⚠️ Quota AI: M5 × 2 mã ≈ 576 lần gọi/ngày (cộng thêm chế độ tự trade). Gói Gemini miễn phí có thể không đủ –
+> giảm số mã, dùng M15, hoặc chỉ dùng `/scalp GOLD` thủ công.
+>
+> ⚠️ Lướt sóng khung ngắn: spread chiếm tỷ lệ lớn hơn so với SL nhỏ → chi phí cao, khó thắng hơn. Luôn thử trên Demo trước.

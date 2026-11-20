@@ -55,8 +55,14 @@ class FakeMT5:
 
 
 class FakeTG:
-    def __init__(self): self.msgs: list[str] = []
+    def __init__(self):
+        self.msgs: list[str] = []
+        self.scalps: list[tuple[str, str, str | None]] = []
+
     def notify(self, text, keyboard=None): self.msgs.append(text)
+
+    def notify_scalp(self, text, signal_id, ai_side):
+        self.scalps.append((text, signal_id, ai_side))
 
 
 def ai_returning(decision: dict) -> AIClient:
@@ -180,3 +186,72 @@ async def test_market_refreshed_after_ai_reply():
     result = await bot._ask_ai(ctx)
     await bot._act(ctx, result)
     assert seen and ctx.tick.bid == pytest.approx(1.111)
+
+
+# ---------------------------------------------------------------- scalp (lướt sóng)
+async def test_scalp_disabled_by_default_sends_nothing():
+    bot, mt5, tg = make_bot(BUY)
+    await bot.scalp_once(force=True)
+    assert tg.scalps == [] and mt5.opened == []
+
+
+async def test_scalp_signal_then_long_button_opens_trade():
+    bot, mt5, tg = make_bot(BUY)
+    bot.set_scalp(True)
+    await bot.scalp_once()
+    assert len(tg.scalps) == 1 and mt5.opened == []  # chỉ gửi nút, KHÔNG tự vào lệnh
+    text, sid, ai_side = tg.scalps[0]
+    assert ai_side == "BUY" and "LƯỚT SÓNG" in text and "Lot" in text
+    await bot.scalp_once()  # cùng nến -> không gửi lại
+    assert len(tg.scalps) == 1
+
+    reply = await bot.execute_scalp(sid, "BUY")
+    assert "DRY-RUN" in reply and "LONG" in reply
+    side, vol, sl, tp = mt5.opened[0]
+    assert side is Side.BUY and sl == pytest.approx(1.1080) and tp == pytest.approx(1.1150)
+    assert "hết hạn" in await bot.execute_scalp(sid, "BUY")  # bấm lần 2 không vào lệnh trùng
+    assert len(mt5.opened) == 1
+
+
+async def test_scalp_short_button_mirrors_sl_tp():
+    bot, mt5, tg = make_bot(BUY)
+    bot.set_scalp(True)
+    await bot.scalp_once()
+    _, sid, _ = tg.scalps[0]
+    await bot.execute_scalp(sid, "SELL")
+    side, _, sl, tp = mt5.opened[0]
+    # SHORT vào ở bid 1.11000, SL cách 0.0021 phía trên, TP cách 0.0049 phía dưới
+    assert side is Side.SELL and sl == pytest.approx(1.1121) and tp == pytest.approx(1.1051)
+
+
+async def test_scalp_skip_and_pause():
+    bot, mt5, tg = make_bot(BUY)
+    bot.set_scalp(True)
+    await bot.scalp_once()
+    assert "bỏ qua" in await bot.execute_scalp(tg.scalps[0][1], "SKIP")
+    bot._scalp_last_bar.clear()
+    await bot.scalp_once()
+    bot.pause()
+    assert "tạm dừng" in await bot.execute_scalp(tg.scalps[1][1], "BUY")
+    assert mt5.opened == []
+
+
+async def test_scalp_auto_skips_hold_but_manual_offers_atr_levels():
+    bot, mt5, tg = make_bot({"action": "HOLD", "confidence": 0.3, "reasoning": "sideway"})
+    bot.set_scalp(True)
+    await bot.scalp_once()
+    assert tg.scalps == []
+    await bot.scalp_signal("EURUSD")  # /scalp EURUSD
+    text, sid, ai_side = tg.scalps[0]
+    assert ai_side is None and "HOLD" in text
+    reply = await bot.execute_scalp(sid, "BUY")
+    assert "DRY-RUN" in reply
+    _, _, sl, tp = mt5.opened[0]
+    assert 1.1101 - sl > 0 and tp - 1.1101 == pytest.approx((1.1101 - sl) * 1.5, rel=1e-3)
+
+
+async def test_scalp_toggle_persists():
+    bot, _, _ = make_bot(BUY)
+    bot.set_scalp(True)
+    bot2 = TradingBot(bot.s, bot.mt5, bot.ai, bot.risk, bot.db, bot.tg)
+    assert bot2.scalp_enabled
