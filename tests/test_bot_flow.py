@@ -142,3 +142,23 @@ async def test_controller_texts():
 @pytest.fixture(autouse=True)
 def _no_file_logs(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+
+
+async def test_stats_text_and_command_scope():
+    bot, mt5, _ = make_bot(BUY)
+    assert "Chưa có lệnh" in await bot.stats_text(30)
+    mt5.pos = [Position(5, "EURUSD", Side.BUY, 0.1, 1.11, 1.115, 1.10, 1.115, 50.0, magic=777)]
+    await bot.monitor_once()
+    mt5.pos = []
+    await bot.monitor_once()
+    text = await bot.stats_text(None)
+    assert "Winrate <b>100.0%</b>" in text and "EURUSD" in text
+
+
+async def test_small_account_snapshot_has_affordable_sl():
+    bot, mt5, _ = make_bot(BUY, min_lot_max_risk_pct=5)
+    mt5.acc = AccountState(1, 100, 100, 0, 100, 0, "USD", 100)
+    ctx = await bot.build_context("EURUSD")
+    # 0.01 lot EURUSD lỗ $1000 cho mỗi 1.0 giá; trần 5% của $100 = $5 -> SL tối đa 0.005 (50 pips)
+    assert ctx.snapshot["risk_rules"]["max_affordable_sl_distance"] == pytest.approx(0.005)
+    assert ctx.snapshot["risk_rules"]["max_risk_pct_per_trade"] == 5

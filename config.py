@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     daily_max_loss_pct: float = Field(3.0, gt=0, le=50)
     daily_loss_close_all: bool = False
     max_spread_points: float = Field(30.0, gt=0)
-    max_spread_overrides: str = ""  # "GOLD:50,BITCOIN_mini:5000"
+    max_spread_overrides: str = ""  # "GOLD:50,BITCOIN:5000"
     max_spread_atr_ratio: float = Field(0.25, ge=0)  # 0 = tắt
     min_confidence: float = Field(0.65, ge=0, le=1)
     min_rr: float = Field(1.2, ge=0)  # 0 = không bắt buộc TP
@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     max_tick_age_sec: int = Field(180, ge=5)
     max_margin_usage_pct: float = Field(30.0, gt=0, le=100)
     max_lot_cap: float = Field(0.0, ge=0)  # 0 = không giới hạn thêm
+    min_lot_max_risk_pct: float = Field(0.0, ge=0, le=10)  # tài khoản nhỏ; 0 = tắt
 
     # ---------------- Storage / logging ----------------
     db_path: str = "data/bot.db"

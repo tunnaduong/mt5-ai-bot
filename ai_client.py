@@ -108,6 +108,8 @@ Rules:
 - BUY: stop_loss < current ask < take_profit. SELL: take_profit < current bid < stop_loss.
 - Base stop_loss on market structure (swing high/low) or ATR; reward:risk must be >= {min_rr}.
 - Stop distance from price must be at least {min_sl_atr} x ATR and at most {max_sl_atr} x ATR of the main timeframe.
+- If risk_rules.max_affordable_sl_distance is present, the account is small: the stop distance from entry
+  MUST NOT exceed it. If no sensible structural stop fits within it, answer HOLD.
 - CLOSE only when there is an open position on this symbol AND the thesis is clearly invalidated.
 - If an open position already exists on the symbol, prefer HOLD unless CLOSE is justified.
 - If signals conflict, spread is wide, or data is insufficient: HOLD with low confidence.

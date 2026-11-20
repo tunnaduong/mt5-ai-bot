@@ -49,6 +49,9 @@ class RiskConfig:
     max_tick_age_sec: int = 180
     max_margin_usage_pct: float = 30.0
     max_lot_cap: float = 0.0
+    # Chế độ tài khoản nhỏ: nếu lot theo % rủi ro < volume_min, cho phép dùng volume_min
+    # khi rủi ro thực của volume_min <= min_lot_max_risk_pct % equity. 0 = tắt.
+    min_lot_max_risk_pct: float = 0.0
 
     def max_spread_for(self, symbol: str) -> float:
         return self.spread_overrides.get(symbol, self.max_spread_points)
@@ -69,7 +72,9 @@ class TradeProposal:
     risk_amount: float = 0.0
     rr: float | None = None
     spread_points: float = 0.0
+    risk_pct: float = 0.0  # rủi ro thực tế (% equity) nếu chạm SL
     reasons: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)  # thông tin, không chặn lệnh
 
     def block(self, reason: str) -> None:
         self.reasons.append(reason)
@@ -107,6 +112,22 @@ def daily_pnl_pct(account: AccountState, day_start_balance: float | None) -> flo
 class RiskManager:
     def __init__(self, config: RiskConfig) -> None:
         self.cfg = config
+
+    @property
+    def max_risk_pct(self) -> float:
+        """Rủi ro tối đa cho phép mỗi lệnh (% equity), tính cả chế độ tài khoản nhỏ."""
+        return max(self.cfg.risk_per_trade_pct, self.cfg.min_lot_max_risk_pct)
+
+    def max_affordable_sl_distance(self, spec: SymbolSpec, equity: float) -> float | None:
+        """Khoảng cách SL (theo giá) lớn nhất mà lot tối thiểu vẫn nằm trong mức rủi ro cho phép.
+
+        Dùng để báo trước cho AI (tài khoản nhỏ). Ước lượng bằng tick_value – chính xác với
+        symbol định giá bằng đồng tiền tài khoản (GOLD, BITCOIN... với tài khoản USD).
+        """
+        if spec.trade_tick_size <= 0 or spec.trade_tick_value <= 0 or spec.volume_min <= 0:
+            return None
+        loss_per_price_unit = spec.volume_min * spec.trade_tick_value / spec.trade_tick_size
+        return equity * self.max_risk_pct / 100.0 / loss_per_price_unit
 
     def daily_loss_hit(self, account: AccountState, day_start_balance: float | None) -> bool:
         return daily_pnl_pct(account, day_start_balance) <= -abs(self.cfg.daily_max_loss_pct)
@@ -252,13 +273,24 @@ class RiskManager:
             raw_volume = min(raw_volume, cfg.max_lot_cap)
         volume = normalize_volume(spec, raw_volume)
         if volume <= 0:
-            p.block(
-                f"lot tính được {raw_volume:.4f} < volume_min {spec.volume_min} "
-                f"(rủi ro min lot = {spec.volume_min * loss_per_lot:.2f} {account.currency} > {risk_amount:.2f})"
-            )
-            return p
+            min_lot_risk = spec.volume_min * loss_per_lot
+            min_lot_risk_pct = min_lot_risk / account.equity * 100.0 if account.equity > 0 else float("inf")
+            if cfg.min_lot_max_risk_pct > 0 and min_lot_risk_pct <= cfg.min_lot_max_risk_pct:
+                volume = spec.volume_min
+                p.notes.append(
+                    f"tài khoản nhỏ: dùng lot tối thiểu {volume}, rủi ro {min_lot_risk_pct:.2f}% "
+                    f"(trần {cfg.min_lot_max_risk_pct}%)"
+                )
+            else:
+                cap = f" > trần {cfg.min_lot_max_risk_pct}%" if cfg.min_lot_max_risk_pct > 0 else ""
+                p.block(
+                    f"lot tính được {raw_volume:.4f} < volume_min {spec.volume_min} "
+                    f"(rủi ro min lot = {min_lot_risk:.2f} {account.currency} = {min_lot_risk_pct:.1f}%{cap})"
+                )
+                return p
         p.volume = volume
         p.risk_amount = round(volume * loss_per_lot, 2)
+        p.risk_pct = round(p.risk_amount / account.equity * 100.0, 2) if account.equity > 0 else 0.0
 
         # 10. Margin
         if margin_fn is not None:

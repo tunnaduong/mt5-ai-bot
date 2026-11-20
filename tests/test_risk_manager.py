@@ -55,7 +55,7 @@ def test_normalize_volume(raw, expected):
 
 
 def test_normalize_volume_step_01():
-    spec = SymbolSpec("BITCOIN_mini", 2, 0.01, 0.01, 0.01, volume_min=0.1, volume_max=100, volume_step=0.1)
+    spec = SymbolSpec("CRYPTO_STEP01", 2, 0.01, 0.01, 0.01, volume_min=0.1, volume_max=100, volume_step=0.1)
     assert normalize_volume(spec, 0.37) == 0.3
     assert normalize_volume(spec, 0.09) == 0.0
 
@@ -215,3 +215,50 @@ async def test_gold_sizing():
     # SL dist 10.30 -> 1030 ticks * $1 = $1030/lot ; risk $100 -> 0.09 lot
     assert p.approved, p.reasons
     assert p.volume == 0.09
+
+
+# ---------------------------------------------------------------- tài khoản nhỏ ($100) – spec thật của FxPro
+BTC = SymbolSpec("BITCOIN", 2, 0.01, 0.01, 0.01, 0.01, 500, 0.01, trade_stops_level=20000)
+GOLDGR = SymbolSpec("GOLDgr", 3, 0.001, 0.001, 0.001, 5.0, 500, 1.0)
+SMALL = AccountState(1, 100, 100, 0, 100, 0, "USD", 100)
+
+
+async def test_small_account_blocked_by_default():
+    d = AIDecision(action=Action.BUY, confidence=0.8, stop_loss=61400.0, take_profit=62700.0)
+    p = await evaluate(d, spec=BTC, tick=Tick("BITCOIN", 61890.0, 61890.0, 0), account=SMALL, dsb=100,
+                       atr=355.0, config=cfg(max_spread_points=5000))
+    assert not p.approved and any("volume_min" in r for r in p.reasons)
+
+
+async def test_small_account_min_lot_bitcoin():
+    # SL $490 -> 0.01 BTC lỗ $4.90 = 4.9% <= trần 5%
+    d = AIDecision(action=Action.BUY, confidence=0.8, stop_loss=61400.0, take_profit=62700.0)
+    p = await evaluate(d, spec=BTC, tick=Tick("BITCOIN", 61890.0, 61890.0, 0), account=SMALL, dsb=100,
+                       atr=355.0, config=cfg(max_spread_points=5000, min_lot_max_risk_pct=5))
+    assert p.approved, p.reasons
+    assert p.volume == 0.01 and p.risk_amount == pytest.approx(4.9) and p.risk_pct == pytest.approx(4.9)
+    assert p.notes and "lot tối thiểu" in p.notes[0]
+
+
+async def test_small_account_over_cap_still_blocked():
+    # SL $700 -> lỗ $7 = 7% > trần 5%
+    d = AIDecision(action=Action.BUY, confidence=0.8, stop_loss=61190.0, take_profit=63000.0)
+    p = await evaluate(d, spec=BTC, tick=Tick("BITCOIN", 61890.0, 61890.0, 0), account=SMALL, dsb=100,
+                       atr=355.0, config=cfg(max_spread_points=5000, min_lot_max_risk_pct=5))
+    assert not p.approved and any("trần 5" in r for r in p.reasons)
+
+
+async def test_small_account_goldgr():
+    # 5 gram, SL 0.6 USD/gram -> lỗ $3 = 3%
+    d = AIDecision(action=Action.SELL, confidence=0.8, stop_loss=113.900, take_profit=112.100)
+    p = await evaluate(d, spec=GOLDGR, tick=Tick("GOLDgr", 113.290, 113.302, 0), account=SMALL, dsb=100,
+                       atr=0.62, config=cfg(max_spread_points=30, min_lot_max_risk_pct=5))
+    assert p.approved, p.reasons
+    assert p.volume == 5.0 and p.risk_amount == pytest.approx(3.05, abs=0.01)
+
+
+def test_max_affordable_sl_distance():
+    rm = RiskManager(cfg(risk_per_trade_pct=1, min_lot_max_risk_pct=5))
+    assert rm.max_affordable_sl_distance(BTC, 100) == pytest.approx(500.0)   # $5 / $0.01 mỗi $1
+    assert rm.max_affordable_sl_distance(GOLD, 100) == pytest.approx(5.0)    # 1 oz: $5 / $1
+    assert rm.max_affordable_sl_distance(GOLDGR, 100) == pytest.approx(1.0)  # 5 g: $5 / $5

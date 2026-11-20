@@ -74,7 +74,7 @@ Test unit thì chạy được trên mọi OS.
 2. Trong terminal: `Tools → Options → Expert Advisors` → tick **Allow algorithmic trading**, rồi bật nút
    **Algo Trading** trên toolbar (màu xanh).
 3. Mở `Market Watch` (Ctrl+M) → chuột phải → *Show All* để chắc các symbol (`GOLD`, `EURUSD`,
-   `BITCOIN_mini`, `ANT.O`...) tồn tại. Tên symbol phải khớp **chính xác** với broker.
+   `BITCOIN`, `ANT.O`...) tồn tại. Tên symbol phải khớp **chính xác** với broker.
 4. Python ≥ 3.11:
    ```powershell
    cd mt5-ai-bot
@@ -148,6 +148,7 @@ Dừng bot: `Ctrl+C` – bot gửi nốt tin Telegram trong hàng đợi, đóng
 |---|---|
 | `/status` | Chạy/tạm dừng, Live/Dry-run, Balance, Equity, Margin level, P&L hôm nay |
 | `/positions` | Vị thế đang mở + P&L (đánh dấu `bot` / `manual`) |
+| `/stats [ngày\|all]` | Winrate, P&L, profit factor, max drawdown, chuỗi thua – theo mã và theo ngày (mặc định 30 ngày) |
 | `/pause`, `/resume` | Dừng/tiếp tục **mở lệnh mới** (monitor SL/TP vẫn chạy; khi pause bot không gọi AI) |
 | `/close_all` | Đóng mọi vị thế, cần bấm **Confirm** trong 60 giây |
 | `/analyze GOLD` | Chạy AI ngay + chỉ báo + risk check thử – **không vào lệnh** |
@@ -169,7 +170,8 @@ tổng kết ngày lúc `DAILY_SUMMARY_HOUR_UTC`.
 8. TP đúng phía, R:R ≥ `MIN_RR`.
 9. Lot = `equity × RISK_PER_TRADE_PCT% / lỗ_mỗi_lot`. Lỗ mỗi lot lấy từ `mt5.order_calc_profit`
    (chính xác cho cặp chéo, vàng, crypto, cổ phiếu); fallback `tick_value/tick_size`. Làm tròn **xuống**
-   theo `volume_step`, kẹp `volume_max`; nếu < `volume_min` → **chặn** (không tự tăng rủi ro).
+   theo `volume_step`, kẹp `volume_max`; nếu < `volume_min` → **chặn**, trừ khi bật `MIN_LOT_MAX_RISK_PCT`
+   và rủi ro của lot tối thiểu nằm dưới trần đó (xem mục 11).
 10. Margin yêu cầu (`order_calc_margin`) ≤ `MAX_MARGIN_USAGE_PCT` × free margin.
 
 Mọi thuộc tính symbol (`digits`, `point`, `volume_*`, `filling_mode`, `trade_stops_level`...) được đọc
@@ -189,10 +191,39 @@ Ví dụ: `SELECT ts, symbol, action, approved, reasons FROM risk_checks ORDER B
 
 ## 10. Lưu ý FxPro
 
-- Symbol FxPro: `GOLD` (không phải XAUUSD), `BITCOIN_mini`, cổ phiếu Mỹ dạng `ANT.O`. Crypto/cổ phiếu có
+- Symbol FxPro: `GOLD` (không phải XAUUSD), `GOLDgr` (vàng theo gram), `BITCOIN`, cổ phiếu Mỹ dạng `ANT.O`. Crypto/cổ phiếu có
   spread lớn và giờ giao dịch riêng → đặt `MAX_SPREAD_OVERRIDES` phù hợp, xem spread thực tế bằng `/analyze`.
 - Tài khoản FxPro MT5 là market execution → filling FOK/IOC; bot tự chọn theo symbol.
 - Cổ phiếu thường có `volume_min` lớn (vd. 1 share/lot) – với vốn nhỏ, risk check có thể chặn vì
   "lot < volume_min": đây là hành vi đúng.
 - Thời gian server FxPro là GMT+2/+3; bot dùng **UTC** cho mốc ngày (daily loss, summary).
 - Lệnh đóng chỉ được ghi nhận/thông báo khi bot đang chạy (bot so sánh danh sách vị thế giữa các nhịp).
+
+## 11. Tài khoản nhỏ (~$100)
+
+Với $100, rủi ro 0.5–1%/lệnh chỉ là $0.5–1, nhỏ hơn mức lỗ của **lot tối thiểu** ở mọi SL hợp lý
+→ mặc định bot chặn hết lệnh. `MIN_LOT_MAX_RISK_PCT` cho phép dùng lot tối thiểu nếu rủi ro thực của nó
+không vượt trần; bot cũng gửi cho AI `max_affordable_sl_distance` để AI chọn SL vừa túi (hoặc HOLD).
+
+Lỗ của lot tối thiểu trên FxPro (tài khoản USD):
+
+| Symbol | Lot tối thiểu | Lỗ mỗi $1 giá | SL tối đa với trần 5% của $100 |
+|---|---|---|---|
+| `BITCOIN` | 0.01 BTC | $0.01 | $500 (broker yêu cầu SL ≥ $200) |
+| `GOLDgr` | 5 gram | $5 / $1 mỗi gram (≈ $0.16 mỗi $1/oz) | $1/gram ≈ $31/oz |
+| `GOLD` | 0.01 lot = 1 oz | $1 | $5 → quá sát, gần như luôn bị chặn |
+
+Cấu hình gợi ý (chấp nhận rủi ro cao hơn nhiều so với tài khoản lớn):
+
+```ini
+SYMBOLS=BITCOIN,GOLDgr          # dùng GOLDgr thay cho GOLD
+RISK_PER_TRADE_PCT=1
+MIN_LOT_MAX_RISK_PCT=5           # mỗi lệnh lỗ tối đa ~$5
+MAX_OPEN_POSITIONS=1             # 1 lệnh tại một thời điểm
+DAILY_MAX_LOSS_PCT=10            # 2 lệnh thua liên tiếp là dừng trong ngày
+MAX_SPREAD_OVERRIDES=BITCOIN:5000,GOLDgr:30
+MAX_MARGIN_USAGE_PCT=60          # đòn bẩy tài khoản thật thấp hơn demo
+```
+
+Lưu ý: 10 lệnh thua liên tiếp ở trần 5% ≈ mất 40% tài khoản. Hãy kiểm chứng bằng `/stats` trên
+demo trước (có thể mở 1 tài khoản demo $100 để thử đúng cấu hình này).

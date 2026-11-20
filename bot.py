@@ -15,6 +15,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -146,6 +147,32 @@ class TradingBot:
         lines.append(f"\nTổng P&amp;L thả nổi: <b>{total:+,.2f}</b>")
         return "\n".join(lines)
 
+    async def stats_text(self, days: int | None = 30) -> str:
+        """Thống kê hiệu suất tích luỹ (lệnh đã đóng) trong `days` ngày gần nhất; None = toàn bộ."""
+        day_from = (utc_now().date() - timedelta(days=days - 1)).isoformat() if days else None
+        st = self.db.performance(day_from)
+        scope = f"{days} ngày gần nhất" if days else "toàn bộ"
+        if st["trades"] == 0:
+            hint = " (DRY-RUN không tạo lệnh thật nên chưa có dữ liệu)" if self.mt5.dry_run else ""
+            return f"📈 <b>STATS ({scope})</b>\nChưa có lệnh nào đóng{hint}."
+        pf = st["profit_factor"]
+        lines = [
+            f"<b>📈 STATS ({scope}, từ {st['first_day']})</b>",
+            f"Lệnh: {st['trades']} (✅ {st['wins']} / ❌ {st['losses']}) | Winrate <b>{st['winrate']:.1f}%</b>",
+            f"P&amp;L realized: <b>{st['pnl']:+,.2f}</b>",
+            f"TB thắng {st['avg_win']:+.2f} | TB thua {st['avg_loss']:+.2f} | "
+            f"Profit factor {'∞' if pf == float('inf') else f'{pf:.2f}'}",
+            f"Max drawdown {st['max_drawdown']:.2f} | Chuỗi thua dài nhất {st['max_losing_streak']}",
+            "",
+            "<b>Theo mã:</b>",
+        ]
+        for sym, x in st["by_symbol"].items():
+            lines.append(f"• {esc(sym)}: {x['trades']} lệnh, WR {x['winrate']:.0f}%, P&amp;L {x['pnl']:+,.2f}")
+        lines.append("\n<b>7 ngày gần nhất:</b>")
+        for day, x in list(st["by_day"].items())[-7:]:
+            lines.append(f"• {day}: {x['trades']} lệnh, WR {x['winrate']:.0f}%, {x['pnl']:+,.2f}")
+        return "\n".join(lines)
+
     async def close_all_positions(self) -> str:
         async with self._trade_lock:
             positions = await self.mt5.positions()
@@ -194,7 +221,8 @@ class TradingBot:
         if proposal:
             if proposal.approved:
                 lines.append(f"🛡 Risk: ✅ sẽ PASS – lot {proposal.volume}, rủi ro {proposal.risk_amount} "
-                             f"{ctx.account.currency}, R:R {proposal.rr}")
+                             f"{ctx.account.currency} ({proposal.risk_pct}%), R:R {proposal.rr}")
+                lines += [f"ℹ️ {esc(n)}" for n in proposal.notes]
             else:
                 lines.append("🛡 Risk: ⛔ BLOCK – " + esc("; ".join(proposal.reasons)))
         lines.append("<i>(Chỉ phân tích, không vào lệnh)</i>")
@@ -247,8 +275,16 @@ class TradingBot:
                 "equity": round(account.equity, 2), "margin_level": round(account.margin_level, 1),
                 "daily_pnl_pct": round(daily_pnl_pct(account, dsb), 2), "open_positions_total": len(positions),
             },
-            "risk_rules": {"min_rr": self.s.min_rr, "max_spread_points": self.risk.cfg.max_spread_for(symbol)},
+            "risk_rules": {
+                "min_rr": self.s.min_rr,
+                "max_spread_points": self.risk.cfg.max_spread_for(symbol),
+                "max_risk_pct_per_trade": self.risk.max_risk_pct,
+            },
         }
+        affordable = self.risk.max_affordable_sl_distance(spec, account.equity)
+        if affordable is not None and atr and affordable < atr * max(self.s.max_sl_atr_mult, 1.0):
+            # Chỉ gửi khi đây thực sự là ràng buộc (tài khoản nhỏ) để không làm nhiễu AI
+            ctx.snapshot["risk_rules"]["max_affordable_sl_distance"] = round(affordable, spec.digits)
         return ctx
 
     async def _ask_ai(self, ctx: SymbolContext) -> AIResult:
@@ -337,8 +373,9 @@ class TradingBot:
             self.tg.notify(
                 f"{tag}\n<b>{esc(ctx.symbol)} {proposal.side.value}</b> {proposal.volume} lot @ {res.price}\n"
                 f"SL {proposal.sl} | TP {proposal.tp or '-'} | R:R {proposal.rr}\n"
-                f"Rủi ro: {proposal.risk_amount} {ctx.account.currency} ({self.s.risk_per_trade_pct}%) "
+                f"Rủi ro: {proposal.risk_amount} {ctx.account.currency} ({proposal.risk_pct}%) "
                 f"| conf {d.confidence:.2f}\n💬 {esc(d.reasoning[:300])}"
+                + "".join(f"\nℹ️ {esc(n)}" for n in proposal.notes)
                 + (f"\nTicket #{res.ticket}" if res.ticket else "")
             )
         else:
@@ -510,6 +547,7 @@ def build_risk_config(s: Settings) -> RiskConfig:
         max_sl_atr_mult=s.max_sl_atr_mult, min_sl_atr_mult=s.min_sl_atr_mult,
         sl_fallback_atr_mult=s.sl_fallback_atr_mult, max_tick_age_sec=s.max_tick_age_sec,
         max_margin_usage_pct=s.max_margin_usage_pct, max_lot_cap=s.max_lot_cap,
+        min_lot_max_risk_pct=s.min_lot_max_risk_pct,
     )
 
 

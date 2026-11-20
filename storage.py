@@ -177,6 +177,57 @@ class Storage:
             "worst": float(row["worst"] or 0.0),
         }
 
+    def performance(self, day_from: str | None = None) -> dict[str, Any]:
+        """Thống kê tích luỹ các lệnh đã đóng từ ngày `day_from` (YYYY-MM-DD, UTC); None = toàn bộ.
+
+        Trả về tổng quan, theo symbol và theo ngày, kèm profit factor, chuỗi thua dài nhất và
+        max drawdown của đường P&L realized.
+        """
+        sql = "SELECT day, symbol, profit FROM closed_trades"
+        params: tuple = ()
+        if day_from:
+            sql += " WHERE day >= ?"
+            params = (day_from,)
+        rows = self._exec(sql + " ORDER BY ts, id", params).fetchall()
+        profits = [float(r["profit"]) for r in rows]
+
+        def summary(values: list[float]) -> dict[str, float]:
+            wins = [v for v in values if v > 0]
+            losses = [v for v in values if v <= 0]
+            gross_win, gross_loss = sum(wins), -sum(losses)
+            return {
+                "trades": len(values),
+                "wins": len(wins),
+                "losses": len(losses),
+                "winrate": len(wins) / len(values) * 100.0 if values else 0.0,
+                "pnl": sum(values),
+                "avg_win": gross_win / len(wins) if wins else 0.0,
+                "avg_loss": -gross_loss / len(losses) if losses else 0.0,
+                "profit_factor": gross_win / gross_loss if gross_loss > 0 else (float("inf") if wins else 0.0),
+            }
+
+        result: dict[str, Any] = summary(profits)
+        equity = peak = max_dd = 0.0
+        streak = max_streak = 0
+        for v in profits:
+            equity += v
+            peak = max(peak, equity)
+            max_dd = max(max_dd, peak - equity)
+            streak = streak + 1 if v <= 0 else 0
+            max_streak = max(max_streak, streak)
+        result["max_drawdown"] = max_dd
+        result["max_losing_streak"] = max_streak
+
+        by_symbol: dict[str, list[float]] = {}
+        by_day: dict[str, list[float]] = {}
+        for r in rows:
+            by_symbol.setdefault(r["symbol"], []).append(float(r["profit"]))
+            by_day.setdefault(r["day"], []).append(float(r["profit"]))
+        result["by_symbol"] = {k: summary(v) for k, v in sorted(by_symbol.items())}
+        result["by_day"] = {k: summary(v) for k, v in sorted(by_day.items())}
+        result["first_day"] = rows[0]["day"] if rows else None
+        return result
+
     def orders_today_count(self, day: str) -> int:
         row = self._exec("SELECT COUNT(*) AS n FROM orders WHERE substr(ts,1,10)=? AND success=1", (day,)).fetchone()
         return int(row["n"] or 0)

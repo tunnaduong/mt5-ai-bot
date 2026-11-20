@@ -39,6 +39,7 @@ class BotController(Protocol):
     def resume(self) -> None: ...
     async def status_text(self) -> str: ...
     async def positions_text(self) -> str: ...
+    async def stats_text(self, days: int | None = 30) -> str: ...
     async def close_all_positions(self) -> str: ...
     async def analyze_text(self, symbol: str) -> str: ...
 
@@ -72,6 +73,7 @@ class TelegramNotifier:
                 await self.app.bot.set_my_commands([
                     BotCommand("status", "Trạng thái bot & tài khoản"),
                     BotCommand("positions", "Vị thế đang mở"),
+                    BotCommand("stats", "Winrate & P&L tích luỹ: /stats 30 hoặc /stats all"),
                     BotCommand("pause", "Tạm dừng mở lệnh mới"),
                     BotCommand("resume", "Tiếp tục mở lệnh mới"),
                     BotCommand("close_all", "Đóng toàn bộ vị thế (có xác nhận)"),
@@ -149,7 +151,7 @@ class TelegramNotifier:
         admin = filters.Chat(chat_id=self.admin_chat_id)
         commands = {
             "start": self._cmd_help, "help": self._cmd_help, "status": self._cmd_status,
-            "positions": self._cmd_positions, "pause": self._cmd_pause, "resume": self._cmd_resume,
+            "positions": self._cmd_positions, "stats": self._cmd_stats, "pause": self._cmd_pause, "resume": self._cmd_resume,
             "close_all": self._cmd_close_all, "analyze": self._cmd_analyze,
         }
         for name, handler in commands.items():
@@ -189,6 +191,7 @@ class TelegramNotifier:
             "<b>🤖 MT5 AI Bot</b>\n"
             "/status – trạng thái bot, balance, equity, P&amp;L hôm nay\n"
             "/positions – vị thế đang mở\n"
+            "/stats [ngày|all] – winrate, P&amp;L tích luỹ (mặc định 30 ngày)\n"
             "/pause – tạm dừng mở lệnh mới\n"
             "/resume – tiếp tục\n"
             "/close_all – đóng toàn bộ vị thế (có xác nhận)\n"
@@ -200,6 +203,17 @@ class TelegramNotifier:
 
     async def _cmd_positions(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         await self._reply(update, await self._ctrl().positions_text())
+
+    async def _cmd_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        arg = (context.args or ["30"])[0].strip().lower()
+        if arg == "all":
+            days: int | None = None
+        elif arg.isdigit() and 1 <= int(arg) <= 3650:
+            days = int(arg)
+        else:
+            await self._reply(update, "Cú pháp: <code>/stats</code>, <code>/stats 7</code> hoặc <code>/stats all</code>")
+            return
+        await self._reply(update, await self._ctrl().stats_text(days))
 
     async def _cmd_pause(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
         self._ctrl().pause()
